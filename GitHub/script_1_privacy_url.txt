@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+import argparse, csv, re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup
+
+MAP_LINE = re.compile(r'^\s*(\d+)\s+(\S+)\s+\[(KNOWN|GUESS)\]\s+(\S+)\s*$')
+
+COMMON_PATHS = [
+    "/privacy", "/privacy-policy", "/privacy_policy", "/privacy-notice",
+    "/legal/privacy", "/policies/privacy", "/help/privacy", "/about/privacy",
+    "/terms/privacy", "/legal/privacy-policy"
+]
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+def normalize_url(u: str) -> str:
+    u = (u or "").strip().strip('",;')
+    if not u:
+        return u
+    if not u.startswith(("http://", "https://")):
+        u = "https://" + u
+    if u.startswith("http://"):
+        u = "https://" + u[len("http://"):]
+    return u
+
+def fetch(url: str, timeout: int):
+    try:
+        r = requests.head(url, allow_redirects=True, timeout=timeout, headers=HEADERS)
+        if r.status_code in (400, 405):
+            r = requests.get(url, allow_redirects=True, timeout=timeout, headers=HEADERS)
+        return r
+    except requests.RequestException:
+        return None
+
+def ok(r):
+    if r is None:
+        return False, "no_response"
+    sc = r.status_code
+    if 200 <= sc < 300:
+        return True, str(sc)
+    if sc == 403:
+        return True, "403_blocked"   # exists but blocks automation
+    return False, str(sc)
+
+def candidate_urls(domain: str):
+    bases = [f"https://{domain}", f"https://www.{domain}"]
+    for base in bases:
+        for p in COMMON_PATHS:
+            yield base + p
+
+def homepage_privacy_link(domain: str, timeout: int):
+    for base in (f"https://{domain}/", f"https://www.{domain}/"):
+        r = fetch(base, timeout)
+        ok1, _ = ok(r)
+        if not ok1 or r is None:
+            continue
+        ct = (r.headers.get("content-type") or "").lower()
+        if "html" not in ct:
+            continue
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        links = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            text = (a.get_text(" ", strip=True) or "").lower()
+            if "privacy" in href.lower() or "privacy" in text:
+                links.append(urljoin(base, href))
+
+        def score(u):
+            u = u.lower()
+            s = 0
+            if "privacy" in u: s += 3
+            if "policy" in u or "notice" in u: s += 2
+            if "legal" in u or "policies" in u: s += 1
+            return -s
+
+        links.sort(key=score)
+        return links[0] if links else None
+    return None
+
+def process_one(rank, domain, tag, url, timeout):
+    orig = url
+    tested = normalize_url(url)
+
+    r = fetch(tested, timeout)
+    ok0, st0 = ok(r)
+    if ok0 and r is not None:
+        return (rank, domain, tag, orig, tested, r.url, st0, "original_or_redirect")
+
+    for cand in candidate_urls(domain):
+        r2 = fetch(cand, timeout)
+        ok2, st2 = ok(r2)
+        if ok2 and r2 is not None:
+            return (rank, domain, tag, orig, cand, r2.url, st2, "common_path")
+
+    cand = homepage_privacy_link(domain, timeout)
+    if cand:
+        r3 = fetch(cand, timeout)
+        ok3, st3 = ok(r3)
+        if ok3 and r3 is not None:
+            return (rank, domain, tag, orig, cand, r3.url, st3, "homepage_link")
+
+    return (rank, domain, tag, orig, tested, tested, st0, "unresolved")
+
+def read_map(path):
+    lines = open(path, "r", encoding="utf-8").read().splitlines()
+    header = []
+    rows = []
+    for line in lines:
+        m = MAP_LINE.match(line)
+        if m:
+            rows.append((int(m.group(1)), m.group(2), m.group(3), m.group(4)))
+        else:
+            header.append(line)
+    return header, rows
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--map", required=True)
+    ap.add_argument("--out-map", default="top1000_domain_policy_map_fixed.txt")
+    ap.add_argument("--out-list", default="top1000_privacy_policy_list_fixed.txt")
+    ap.add_argument("--report", default="privacy_fix_report.csv")
+    ap.add_argument("--workers", type=int, default=20)
+    ap.add_argument("--timeout", type=int, default=15)
+    args = ap.parse_args()
+
+    header, rows = read_map(args.map)
+
+    results = []
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futs = [ex.submit(process_one, *row, args.timeout) for row in rows]
+        for fut in as_completed(futs):
+            results.append(fut.result())
+
+    results.sort(key=lambda x: x[0])
+
+    with open(args.report, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["rank","domain","tag","orig_url","tested_url","final_url","status","fix_method"])
+        w.writerows(results)
+
+    out_lines = []
+    for line in header:
+        out_lines.append(line.rstrip())
+    for rank, domain, tag, orig, tested, final, status, method in results:
+        out_lines.append(f"{rank:<6} {domain:<40} [{tag}] {final}")
+    open(args.out_map, "w", encoding="utf-8").write("\n".join(out_lines) + "\n")
+
+    seen = set()
+    urls = []
+    for r in results:
+        final = r[5]
+        if final not in seen:
+            seen.add(final)
+            urls.append(final)
+    open(args.out_list, "w", encoding="utf-8").write("\n".join(urls) + "\n")
+
+    unresolved = sum(1 for r in results if r[7] == "unresolved")
+    print(f"Done. Total={len(results)} unresolved={unresolved}")
+    print(f"Wrote: {args.out_map}, {args.out_list}, {args.report}")
+
+if __name__ == "__main__":
+    main()

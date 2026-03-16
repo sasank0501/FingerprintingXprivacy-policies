@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""
+Download privacy policies from a CSV file with columns: Number, URL
+
+Usage:
+    python download_100_privacy_policies.py
+    python download_100_privacy_policies.py --input numbered_100_privacy_policy_sites.csv
+    python download_100_privacy_policies.py --workers 8 --timeout 35
+
+Outputs:
+    downloaded_privacy_policies/
+        001_example_com.html
+        002_example_com.pdf
+        ...
+        download_manifest.csv
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import re
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Dict, Tuple
+from urllib.parse import urlparse
+
+try:
+    import requests
+except Exception:
+    print("This script requires the 'requests' package.")
+    print("Install it with: pip install requests")
+    raise
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/145.0.0.0 Safari/537.36"
+)
+
+HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "application/pdf,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
+
+def sanitize_host(url: str) -> str:
+    host = urlparse(url).netloc.lower().replace("www.", "")
+    host = re.sub(r"[^a-z0-9._-]+", "_", host)
+    return host or "site"
+
+def pick_extension(content_type: str, final_url: str) -> str:
+    ct = (content_type or "").lower()
+    path = urlparse(final_url).path.lower()
+    if "pdf" in ct or path.endswith(".pdf"):
+        return ".pdf"
+    if "json" in ct or path.endswith(".json"):
+        return ".json"
+    if "xml" in ct or path.endswith(".xml"):
+        return ".xml"
+    if path.endswith(".txt") or "text/plain" in ct:
+        return ".txt"
+    return ".html"
+
+def looks_like_html(response: requests.Response) -> bool:
+    ct = (response.headers.get("Content-Type") or "").lower()
+    return "html" in ct or response.text.lstrip().lower().startswith(("<!doctype html", "<html"))
+
+def fetch_one(row: Dict[str, str], out_dir: Path, timeout: int) -> Dict[str, str]:
+    number = int(row["Number"])
+    url = row["URL"].strip()
+    host = sanitize_host(url)
+
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    result = {
+        "Number": str(number),
+        "URL": url,
+        "FinalURL": "",
+        "Filename": "",
+        "Status": "",
+        "HTTPStatus": "",
+        "ContentType": "",
+        "Bytes": "",
+        "Error": "",
+    }
+
+    try:
+        # Try GET directly because some sites block HEAD or behave differently.
+        response = session.get(url, timeout=timeout, allow_redirects=True, stream=True)
+        result["HTTPStatus"] = str(response.status_code)
+        result["FinalURL"] = response.url
+        result["ContentType"] = response.headers.get("Content-Type", "")
+
+        response.raise_for_status()
+
+        ext = pick_extension(result["ContentType"], response.url)
+        filename = f"{number:03d}_{host}{ext}"
+        filepath = out_dir / filename
+
+        with open(filepath, "wb") as f:
+            total = 0
+            for chunk in response.iter_content(chunk_size=65536):
+                if chunk:
+                    f.write(chunk)
+                    total += len(chunk)
+
+        # Small quality check for HTML pages that return bot-block pages or empty files.
+        if ext == ".html":
+            try:
+                text_sample = filepath.read_text(encoding="utf-8", errors="ignore")[:3000].lower()
+                if any(token in text_sample for token in [
+                    "access denied", "forbidden", "captcha", "attention required",
+                    "verify you are human", "bot detection"
+                ]):
+                    result["Status"] = "blocked"
+                else:
+                    result["Status"] = "ok"
+            except Exception:
+                result["Status"] = "ok"
+        else:
+            result["Status"] = "ok"
+
+        result["Filename"] = filename
+        result["Bytes"] = str(filepath.stat().st_size)
+        return result
+
+    except Exception as e:
+        result["Status"] = "failed"
+        result["Error"] = f"{type(e).__name__}: {e}"
+        return result
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--input",
+        default="numbered_100_privacy_policy_sites.csv",
+        help="Input CSV with columns: Number, URL",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="downloaded_privacy_policies",
+        help="Folder to store downloaded policies",
+    )
+    parser.add_argument("--workers", type=int, default=6, help="Concurrent downloads")
+    parser.add_argument("--timeout", type=int, default=30, help="Per-request timeout in seconds")
+    args = parser.parse_args()
+
+    input_csv = Path(args.input)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if not input_csv.exists():
+        print(f"Input file not found: {input_csv}")
+        return 1
+
+    with open(input_csv, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    required = {"Number", "URL"}
+    if not rows or not required.issubset(set(rows[0].keys())):
+        print("CSV must contain columns: Number, URL")
+        return 1
+
+    results = []
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
+        futures = [ex.submit(fetch_one, row, out_dir, args.timeout) for row in rows]
+        for i, fut in enumerate(as_completed(futures), start=1):
+            res = fut.result()
+            results.append(res)
+            print(f"[{i}/{len(rows)}] {res['Number']}: {res['Status']} - {res['URL']}")
+
+    results.sort(key=lambda r: int(r["Number"]))
+
+    manifest = out_dir / "download_manifest.csv"
+    with open(manifest, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "Number", "URL", "FinalURL", "Filename", "Status",
+                "HTTPStatus", "ContentType", "Bytes", "Error"
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(results)
+
+    ok = sum(r["Status"] == "ok" for r in results)
+    blocked = sum(r["Status"] == "blocked" for r in results)
+    failed = sum(r["Status"] == "failed" for r in results)
+
+    print("\nFinished.")
+    print(f"Saved files in: {out_dir.resolve()}")
+    print(f"Manifest: {manifest.resolve()}")
+    print(f"OK: {ok} | Blocked: {blocked} | Failed: {failed}")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
